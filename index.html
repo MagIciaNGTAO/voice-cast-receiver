@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Karaoke</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: -apple-system, sans-serif; }
+    #idle-screen {
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      width: 100vw; height: 100vh;
+      color: #fff;
+    }
+    #idle-screen h1 { font-size: 64px; font-weight: 300; margin-bottom: 16px; }
+    #idle-screen p { font-size: 24px; color: rgba(255,255,255,0.5); }
+    #player-container {
+      display: none;
+      width: 100vw; height: 100vh;
+    }
+    #player {
+      width: 100vw; height: 100vh;
+    }
+  </style>
+</head>
+<body>
+  <div id="idle-screen">
+    <h1>Voice Karaoke</h1>
+    <p>Waiting for a song...</p>
+  </div>
+  <div id="player-container">
+    <div id="player"></div>
+  </div>
+
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <script>
+    const CHANNEL = 'urn:x-cast:com.voice.karaoke';
+    const context = cast.framework.CastReceiverContext.getInstance();
+
+    let ytPlayer = null;
+    let ytReady = false;
+    let pendingVideoId = null;
+
+    // --- YouTube IFrame API ---
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    document.head.appendChild(tag);
+
+    window.onYouTubeIframeAPIReady = function() {
+      ytPlayer = new YT.Player('player', {
+        width: '100%',
+        height: '100%',
+        playerVars: {
+          autoplay: 0,
+          controls: 0,
+          disablekb: 1,
+          fs: 0,
+          modestbranding: 1,
+          rel: 0,
+          iv_load_policy: 3
+        },
+        events: {
+          onReady: function() {
+            ytReady = true;
+            console.log('[Receiver] YT player ready');
+            if (pendingVideoId) {
+              playVideo(pendingVideoId);
+              pendingVideoId = null;
+            }
+          },
+          onStateChange: function(e) {
+            if (e.data === YT.PlayerState.ENDED) {
+              console.log('[Receiver] Video ended');
+              send({ event: 'ended' });
+            }
+          },
+          onError: function(e) {
+            console.log('[Receiver] YT error:', e.data);
+            send({ event: 'error', code: e.data });
+          }
+        }
+      });
+    };
+
+    function playVideo(videoId) {
+      document.getElementById('idle-screen').style.display = 'none';
+      document.getElementById('player-container').style.display = 'block';
+      ytPlayer.loadVideoById(videoId);
+      console.log('[Receiver] Playing:', videoId);
+    }
+
+    function send(obj) {
+      context.sendCustomMessage(CHANNEL, undefined, obj);
+    }
+
+    // --- Handle messages from the iPad sender ---
+    context.addCustomMessageListener(CHANNEL, function(event) {
+      const data = event.data;
+      console.log('[Receiver] Message:', JSON.stringify(data));
+
+      if (data.action === 'load' && data.videoId) {
+        if (ytReady && ytPlayer) {
+          playVideo(data.videoId);
+        } else {
+          pendingVideoId = data.videoId;
+        }
+      } else if (data.action === 'stop') {
+        if (ytPlayer) ytPlayer.stopVideo();
+        document.getElementById('idle-screen').style.display = 'flex';
+        document.getElementById('player-container').style.display = 'none';
+      }
+    });
+
+    // --- Start receiver ---
+    const opts = new cast.framework.CastReceiverOptions();
+    opts.disableIdleTimeout = true;
+    context.start(opts);
+    console.log('[Receiver] Started');
+  </script>
+</body>
+</html>

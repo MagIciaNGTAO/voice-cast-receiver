@@ -15,12 +15,11 @@
     }
     #idle-screen h1 { font-size: 64px; font-weight: 300; margin-bottom: 16px; }
     #idle-screen p { font-size: 24px; color: rgba(255,255,255,0.5); }
-    #player-container {
+    #player-frame {
       display: none;
+      position: fixed; top: 0; left: 0;
       width: 100vw; height: 100vh;
-    }
-    #player {
-      width: 100vw; height: 100vh;
+      border: none;
     }
   </style>
 </head>
@@ -29,65 +28,92 @@
     <h1>Voice Karaoke</h1>
     <p>Waiting for a song...</p>
   </div>
-  <div id="player-container">
-    <div id="player"></div>
-  </div>
+  <iframe id="player-frame" allow="autoplay; encrypted-media" allowfullscreen></iframe>
 
   <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
   <script>
     const CHANNEL = 'urn:x-cast:com.voice.karaoke';
     const context = cast.framework.CastReceiverContext.getInstance();
+    const frame = document.getElementById('player-frame');
+    const idle = document.getElementById('idle-screen');
 
-    let ytPlayer = null;
-    let ytReady = false;
-    let pendingVideoId = null;
+    let currentVideoId = null;
+    let pollInterval = null;
 
-    // --- YouTube IFrame API ---
-    const tag = document.createElement('script');
-    tag.src = 'https://www.youtube.com/iframe_api';
-    document.head.appendChild(tag);
+    function loadVideo(videoId) {
+      currentVideoId = videoId;
+      idle.style.display = 'none';
+      frame.style.display = 'block';
+      // Load the full YouTube mobile watch page — may inherit device Google account
+      frame.src = 'https://m.youtube.com/watch?v=' + videoId;
+      console.log('[Receiver] Loading watch page:', videoId);
 
-    window.onYouTubeIframeAPIReady = function() {
-      ytPlayer = new YT.Player('player', {
-        width: '100%',
-        height: '100%',
-        playerVars: {
-          autoplay: 0,
-          controls: 0,
-          disablekb: 1,
-          fs: 0,
-          modestbranding: 1,
-          rel: 0,
-          iv_load_policy: 3
-        },
-        events: {
-          onReady: function() {
-            ytReady = true;
-            console.log('[Receiver] YT player ready');
-            if (pendingVideoId) {
-              playVideo(pendingVideoId);
-              pendingVideoId = null;
-            }
-          },
-          onStateChange: function(e) {
-            if (e.data === YT.PlayerState.ENDED) {
-              console.log('[Receiver] Video ended');
-              send({ event: 'ended' });
-            }
-          },
-          onError: function(e) {
-            console.log('[Receiver] YT error:', e.data);
-            send({ event: 'error', code: e.data });
+      // Start polling once the iframe loads
+      frame.onload = function() {
+        console.log('[Receiver] Watch page loaded');
+        startPolling();
+        // Inject keep-alive and auto-play JS after a delay
+        setTimeout(injectKeepAlive, 3000);
+      };
+    }
+
+    function injectKeepAlive() {
+      try {
+        var doc = frame.contentDocument || frame.contentWindow.document;
+        var script = doc.createElement('script');
+        script.textContent = `
+          if (!window._castKeepAlive) {
+            window._castKeepAlive = true;
+            setInterval(function() {
+              var v = document.querySelector('video');
+              if (!v) return;
+              // Auto-play if paused (dismiss YouTube interruptions)
+              if (v.paused && !v.ended) {
+                v.play().catch(function(){});
+              }
+              // Click dismiss/skip buttons
+              var btns = document.querySelectorAll(
+                '[aria-label="No thanks"], [aria-label="Dismiss"], ' +
+                '.dismiss-button, ytm-dialog-renderer button, ' +
+                '.ytp-ad-skip-button, .ytp-ad-skip-button-modern, ' +
+                '.ytp-ad-skip-button-slot button'
+              );
+              btns.forEach(function(b) { if (b.offsetParent) b.click(); });
+            }, 500);
           }
-        }
-      });
-    };
+        `;
+        doc.body.appendChild(script);
+        console.log('[Receiver] Keep-alive injected');
+      } catch(e) {
+        // Cross-origin — can't inject. Fall back to polling only.
+        console.log('[Receiver] Cannot inject into iframe (cross-origin):', e.message);
+      }
+    }
 
-    function playVideo(videoId) {
-      document.getElementById('idle-screen').style.display = 'none';
-      document.getElementById('player-container').style.display = 'block';
-      ytPlayer.loadVideoById(videoId);
-      console.log('[Receiver] Playing:', videoId);
+    function startPolling() {
+      if (pollInterval) clearInterval(pollInterval);
+      pollInterval = setInterval(function() {
+        try {
+          var doc = frame.contentDocument || frame.contentWindow.document;
+          var v = doc.querySelector('video');
+          if (v && v.ended) {
+            console.log('[Receiver] Video ended');
+            send({ event: 'ended' });
+            clearInterval(pollInterval);
+            pollInterval = null;
+          }
+        } catch(e) {
+          // Cross-origin — can't poll. Use message-based approach below.
+        }
+      }, 1000);
+    }
+
+    function stopVideo() {
+      if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+      frame.src = 'about:blank';
+      frame.style.display = 'none';
+      idle.style.display = 'flex';
+      currentVideoId = null;
     }
 
     function send(obj) {
@@ -96,24 +122,18 @@
 
     // --- Handle messages from the iPad sender ---
     context.addCustomMessageListener(CHANNEL, function(event) {
-      const data = event.data;
+      var data = event.data;
       console.log('[Receiver] Message:', JSON.stringify(data));
 
       if (data.action === 'load' && data.videoId) {
-        if (ytReady && ytPlayer) {
-          playVideo(data.videoId);
-        } else {
-          pendingVideoId = data.videoId;
-        }
+        loadVideo(data.videoId);
       } else if (data.action === 'stop') {
-        if (ytPlayer) ytPlayer.stopVideo();
-        document.getElementById('idle-screen').style.display = 'flex';
-        document.getElementById('player-container').style.display = 'none';
+        stopVideo();
       }
     });
 
     // --- Start receiver ---
-    const opts = new cast.framework.CastReceiverOptions();
+    var opts = new cast.framework.CastReceiverOptions();
     opts.disableIdleTimeout = true;
     context.start(opts);
     console.log('[Receiver] Started');
